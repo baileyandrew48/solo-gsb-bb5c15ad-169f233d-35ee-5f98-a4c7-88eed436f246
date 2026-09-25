@@ -20,6 +20,7 @@
 - 支持 `POST /annotation-migrate`：对旧版修订文本与新版修订稿做全局顺序对齐，按相同字符的匹配关系把旧稿批注区间迁移到新稿（complete/partial/orphan），并给出新稿片段的首末毫秒。
 - 支持 `POST /redact`：复用校时输入与逐字时间轴，对修订文本做敏感词精确命中脱敏（等长 █ 遮蔽），并给出扩展 padding、裁剪到录音边界后的音频静音毫秒区间。
 - 支持 `POST /clip-plan`：复用校时输入与逐字时间轴，把修订稿上选中的 1～20 个非空字符区间映射为源录音裁剪与成片拼接方案（扩展留白、裁剪边界、合并重叠/相接片段，避免声音重复）。
+- 支持 `POST /coverage-gaps`：复用校时输入与逐字时间轴，把识别字符的半开毫秒区间视为覆盖，审计录音 `[0,total_duration)` 中时长不少于 `min_gap_ms` 的未覆盖缺口（含首尾空洞），并给出缺口两侧最近的 matched 修订字符下标与落入缺口的连续 computed 字符段，便于听审区分未识别音频与插值文字。
 - 提供 `/health` 健康检查。
 - 对齐内核为 **C（ctypes 调用）**，无编译器时自动回退**纯 Python** 实现，二者算法一致。
 
@@ -45,6 +46,7 @@ docker compose up --build -d
 - 批注迁移接口：`POST http://localhost:8000/annotation-migrate`
 - 敏感词脱敏接口：`POST http://localhost:8000/redact`
 - 成片剪辑规划接口：`POST http://localhost:8000/clip-plan`
+- 覆盖缺口审计接口：`POST http://localhost:8000/coverage-gaps`
 - 交互式文档：`http://localhost:8000/docs`（OpenAPI：`/openapi.json`）
 
 停止：
@@ -796,6 +798,75 @@ curl -X POST http://localhost:8000/clip-plan \
 合并成同一个源录音片段 `[0,550]`（成片总时长 550ms，声音不重复），两个选择
 的 `segment_index` 均为 0。
 
+### `POST /coverage-gaps`
+
+在执行与 `/align` 完全相同的输入校验和逐字校时后，把**原始识别字符**的
+半开毫秒区间 `[start, end)` 视为对录音的覆盖（**零时长字符不覆盖**），
+求其在录音 `[0, total_duration)` 内的互补，得到按时间升序的**覆盖缺口**
+序列（录音首尾的空洞同样保留），仅输出**时长不少于 `min_gap_ms`** 的缺口，
+并为每个缺口标注两侧文本位置，便于听审区分**未识别音频**与**插值文字**。
+
+请求体包含 `/align` 的全部字段，另加：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `min_gap_ms` | 整数 | 缺口最小时长（毫秒），**正整数**；仅输出时长不少于该值的缺口 |
+
+缺口规则：
+
+1. 覆盖 = 所有**正时长**识别字符的 `[start, end)` 之并；零时长识别字符
+   （`start == end`）不产生覆盖，被删除的识别字符仍然覆盖；
+2. 缺口 = 覆盖在 `[0, total_duration)` 内的互补，含首空洞
+   `[0, 首个覆盖起点)` 与尾空洞 `[末个覆盖终点, total_duration)`；
+3. 仅保留 `end - start >= min_gap_ms` 的缺口，按起始时间升序输出。
+
+示例（“呀”为新增字符，推算区间为 `[300,600]`，恰好填满一个缺口）：
+
+```bash
+curl -X POST http://localhost:8000/coverage-gaps \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "recognized": [
+      {"char":"你","start":0,"end":100},
+      {"char":"好","start":200,"end":300},
+      {"char":"世","start":600,"end":700},
+      {"char":"界","start":800,"end":900}
+    ],
+    "total_duration": 1000,
+    "revised_text": "你好呀世界",
+    "min_gap_ms": 100
+  }'
+```
+
+响应：
+
+```json
+[
+  {"start": 100, "end": 200, "prev_matched_index": 0, "next_matched_index": 1,
+   "computed_spans": []},
+  {"start": 300, "end": 600, "prev_matched_index": 1, "next_matched_index": 3,
+   "computed_spans": [{"start_index": 2, "end_index": 3}]},
+  {"start": 700, "end": 800, "prev_matched_index": 3, "next_matched_index": 4,
+   "computed_spans": []},
+  {"start": 900, "end": 1000, "prev_matched_index": 4, "next_matched_index": null,
+   "computed_spans": []}
+]
+```
+
+字段说明：
+
+- 按**缺口起始时间升序**返回；没有满足条件的缺口时返回 `[]`。
+- `start` / `end`：缺口的半开毫秒区间 `[start, end)`。
+- `prev_matched_index` / `next_matched_index`：按 `matched_index` 查找的缺口
+  **两侧最近 matched 修订字符**在修订文本中的下标（从 0 开始）——左侧取识别
+  字符 `end` 不超过缺口起点的最后一个，右侧取识别字符 `start` 不小于缺口
+  终点的第一个；某一侧没有任何 matched 字符时为 `null`。
+- `computed_spans`：时间区间与缺口相交（`start < 缺口end` 且 `end > 缺口start`）
+  的 **computed（插值）修订字符**的连续半开下标段（`end_index` 不含），
+  按原文顺序；无相交时为空列表。相交的 computed 字符被 matched 字符
+  （如落在缺口内的零时长字符）打断时会产生多段。上例中“呀”的推算区间
+  `[300,600]` 与第二个缺口 `[300,600)` 相交，故段 `[2,3)` 落在该缺口上。
+
 ### 输入校验（HTTP 422）
 
 例如 `end < start`：
@@ -816,7 +887,8 @@ curl -X POST http://localhost:8000/clip-plan \
 批注 ID 为空或重复、区间为空或越出旧版修订文本，以及 `/redact` 的敏感词数量
 不在 1～50、敏感词为空或重复、`padding_ms` 不在 0～1000，以及 `/clip-plan`
 的选择区间数量不在 1～20、区间为空/为负/越出修订稿、未按修订稿顺序排列或
-互相重叠、映射后为零时长区间、`padding_ms` 不在 0～2000 等。
+互相重叠、映射后为零时长区间、`padding_ms` 不在 0～2000，以及
+`/coverage-gaps` 的 `min_gap_ms` 缺失、非整数或不是正整数等。
 
 ---
 
@@ -874,6 +946,7 @@ app/
   annotation.py      批注迁移（旧新文本全局对齐、存活字符最小覆盖区间与状态判定）
   redact.py          敏感词脱敏（精确命中合并、等长 █ 遮蔽与静音毫秒区间生成）
   clip_plan.py       成片剪辑规划（字符区间映射、留白扩展/裁剪、源录音区间合并与成片拼接）
+  coverage.py        录音覆盖缺口审计（覆盖互补、两侧 matched 定位与 computed 相交段合并）
   alignment.py       内核加载（C → 即时编译 → 纯 Python）
   align_py.py        纯 Python 后备内核
   native/align_c.c   C 对齐内核源码

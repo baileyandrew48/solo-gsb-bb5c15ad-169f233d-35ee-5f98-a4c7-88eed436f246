@@ -2179,3 +2179,183 @@ def test_clip_plan_selection_extra_field_rejected(client):
         "padding_ms": 0})
     assert r.status_code == 422
     assert "不允许" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 覆盖缺口审计 POST /coverage-gaps
+# ---------------------------------------------------------------------------
+def _gaps(client, items, revised, min_gap_ms=1, total=1000):
+    payload = {
+        "recognized": rc(items),
+        "total_duration": total,
+        "revised_text": revised,
+        "min_gap_ms": min_gap_ms,
+    }
+    return client.post("/coverage-gaps", json=payload)
+
+
+def test_coverage_gaps_head_middle_and_tail_holes(client):
+    # 覆盖 [200,300) 与 [400,500)：首空洞 [0,200)、中间空洞、尾空洞都保留
+    r = _gaps(client, [("你", 200, 300), ("好", 400, 500)], "你好")
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"start": 0, "end": 200, "prev_matched_index": None,
+         "next_matched_index": 0, "computed_spans": []},
+        {"start": 300, "end": 400, "prev_matched_index": 0,
+         "next_matched_index": 1, "computed_spans": []},
+        {"start": 500, "end": 1000, "prev_matched_index": 1,
+         "next_matched_index": None, "computed_spans": []},
+    ]
+
+
+def test_coverage_gaps_min_gap_ms_filters_short_gaps(client):
+    items = [("你", 200, 300), ("好", 400, 500)]
+    # 缺口时长 200 / 100 / 500：仅保留不少于 300 的尾空洞
+    r = _gaps(client, items, "你好", min_gap_ms=300)
+    assert r.status_code == 200, r.text
+    assert [(g["start"], g["end"]) for g in r.json()] == [(500, 1000)]
+    # 时长恰等于 min_gap_ms 的缺口保留（不少于即 >=）
+    r = _gaps(client, items, "你好", min_gap_ms=200)
+    assert [(g["start"], g["end"]) for g in r.json()] == [(0, 200), (500, 1000)]
+    # 超过最大缺口时长时无缺口
+    r = _gaps(client, items, "你好", min_gap_ms=501)
+    assert r.json() == []
+
+
+def test_coverage_gaps_zero_duration_char_does_not_cover(client):
+    # 零时长识别字符 b[100,100] 不覆盖：缺口为 [100,200)；
+    # b 的 end 不超过缺口起点，按 matched_index 归为左侧最近 matched
+    r = _gaps(client, [("a", 0, 100), ("b", 100, 100), ("c", 200, 300)],
+              "abc", total=300)
+    assert r.status_code == 200, r.text
+    assert r.json() == [{
+        "start": 100, "end": 200, "prev_matched_index": 1,
+        "next_matched_index": 2, "computed_spans": []}]
+
+
+def test_coverage_gaps_computed_chars_merged_into_span(client):
+    # “呀好呀”为新增字符，在空档 [100,400] 内均分为 [100,200] [200,300] [300,400]
+    r = _gaps(client, [("你", 0, 100), ("世", 400, 500)], "你呀好呀世",
+              total=600)
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"start": 100, "end": 400, "prev_matched_index": 0,
+         "next_matched_index": 4,
+         "computed_spans": [{"start_index": 1, "end_index": 4}]},
+        {"start": 500, "end": 600, "prev_matched_index": 4,
+         "next_matched_index": None, "computed_spans": []},
+    ]
+
+
+def test_coverage_gaps_computed_spans_split_by_matched_char(client):
+    # 零时长 matched 字符 b[150,150] 落在缺口 [100,200) 内，
+    # 把相交的 computed 字符 X[100,150]、Y[150,200] 打断为两段
+    r = _gaps(client, [("a", 0, 100), ("b", 150, 150), ("c", 200, 300)],
+              "aXbYc", total=300)
+    assert r.status_code == 200, r.text
+    assert r.json() == [{
+        "start": 100, "end": 200, "prev_matched_index": 0,
+        "next_matched_index": 4,
+        "computed_spans": [
+            {"start_index": 1, "end_index": 2},
+            {"start_index": 3, "end_index": 4},
+        ]}]
+
+
+def test_coverage_gaps_computed_touching_gap_boundary_not_intersecting(client):
+    # 新增字符 X 在零空档 [100,100] 推算为零时长，恰在缺口 [100,200) 起点：
+    # 半开区间端点相接不算相交；零时长 matched 字符 b 归缺口左侧
+    r = _gaps(client, [("a", 0, 100), ("b", 100, 100), ("c", 200, 300)],
+              "aXbc", total=300)
+    assert r.status_code == 200, r.text
+    assert r.json() == [{
+        "start": 100, "end": 200, "prev_matched_index": 2,
+        "next_matched_index": 3, "computed_spans": []}]
+
+
+def test_coverage_gaps_zero_duration_computed_inside_gap_intersects(client):
+    # 新增字符 X 推算为零时长 [150,150]，时点严格位于缺口 [100,200) 内部，
+    # 视为与缺口相交（便于听审发现落在未识别音频内的插值文字）
+    r = _gaps(client, [
+        ("a", 0, 100), ("b", 150, 150), ("c", 150, 150), ("d", 200, 300),
+    ], "abXcd", total=300)
+    assert r.status_code == 200, r.text
+    assert r.json() == [{
+        "start": 100, "end": 200, "prev_matched_index": 0,
+        "next_matched_index": 4,
+        "computed_spans": [{"start_index": 2, "end_index": 3}]}]
+
+
+def test_coverage_gaps_empty_recognized_whole_recording_is_gap(client):
+    # 无识别字符：整段录音为一个缺口，全部新增字符与之相交
+    r = _gaps(client, [], "甲乙", total=300)
+    assert r.status_code == 200, r.text
+    assert r.json() == [{
+        "start": 0, "end": 300, "prev_matched_index": None,
+        "next_matched_index": None,
+        "computed_spans": [{"start_index": 0, "end_index": 2}]}]
+
+
+def test_coverage_gaps_empty_revised_text(client):
+    r = _gaps(client, [("a", 0, 100)], "", total=200)
+    assert r.status_code == 200, r.text
+    assert r.json() == [{
+        "start": 100, "end": 200, "prev_matched_index": None,
+        "next_matched_index": None, "computed_spans": []}]
+
+
+def test_coverage_gaps_full_coverage_returns_empty(client):
+    r = _gaps(client, [("a", 0, 500), ("b", 500, 1000)], "ab")
+    assert r.status_code == 200, r.text
+    assert r.json() == []
+
+
+def test_coverage_gaps_zero_total_duration_returns_empty(client):
+    # 缺口 [0,0) 时长为 0，被正整数 min_gap_ms 过滤
+    r = _gaps(client, [], "甲", total=0)
+    assert r.status_code == 200, r.text
+    assert r.json() == []
+
+
+def test_coverage_gaps_deleted_char_interval_still_covers(client):
+    # 被删除的识别字符 x[200,300] 仍属覆盖，缺口只在其两侧
+    r = _gaps(client, [("a", 0, 100), ("x", 200, 300), ("b", 400, 500)],
+              "ab", total=600)
+    assert r.status_code == 200, r.text
+    assert [(g["start"], g["end"]) for g in r.json()] == [
+        (100, 200), (300, 400), (500, 600)]
+
+
+def test_coverage_gaps_reuses_alignment_validation(client):
+    r = _gaps(client, [("a", 300, 100)], "a", total=500)
+    assert r.status_code == 422
+    assert "结束时间" in r.json()["detail"]
+
+
+def test_coverage_gaps_missing_min_gap_ms_rejected(client):
+    r = client.post("/coverage-gaps", json={
+        "recognized": [], "total_duration": 0, "revised_text": ""})
+    assert r.status_code == 422
+    assert "min_gap_ms" in r.json()["detail"]
+
+
+def test_coverage_gaps_min_gap_ms_must_be_positive(client):
+    for bad in (0, -5):
+        r = _gaps(client, [], "", min_gap_ms=bad, total=0)
+        assert r.status_code == 422, (bad, r.text)
+        assert "正整数" in r.json()["detail"]
+
+
+def test_coverage_gaps_min_gap_ms_wrong_type(client):
+    for bad in ("50", 1.5):
+        r = _gaps(client, [], "", min_gap_ms=bad, total=0)
+        assert r.status_code == 422, (bad, r.text)
+        assert "整数" in r.json()["detail"]
+
+
+def test_coverage_gaps_extra_field_rejected(client):
+    r = client.post("/coverage-gaps", json={
+        "recognized": [], "total_duration": 0, "revised_text": "",
+        "min_gap_ms": 1, "bogus": 1})
+    assert r.status_code == 422
+    assert "不允许" in r.json()["detail"]
