@@ -11,6 +11,7 @@ from . import alignment
 from .annotation import build_annotation_migrations, validate_annotations
 from .captions import build_captions
 from .clip_plan import build_clip_plan, validate_clip_selections
+from .coverage import build_coverage_gaps
 from .entity_links import build_entity_links, validate_entity_links
 from .errors import InvalidTimelineError
 from .schemas import (
@@ -22,6 +23,8 @@ from .schemas import (
     CaptionsRequest,
     ClipPlanRequest,
     ClipPlanResponse,
+    CoverageGap,
+    CoverageGapsRequest,
     EntityLinksRequest,
     EntityLinksResponse,
     HealthResponse,
@@ -85,7 +88,8 @@ async def validation_handler(request: Request,
         if etype == "missing":
             messages.append(f"缺少必填字段：{loc}")
         elif etype in ("int_type", "int_parsing"):
-            if loc.endswith(("max_edits", "max_chars", "padding_ms")):
+            if loc.endswith(("max_edits", "max_chars", "padding_ms",
+                             "min_gap_ms")):
                 messages.append(f"字段 {loc} 必须是整数")
             elif loc.endswith(("start_index", "end_index")):
                 messages.append(f"字段 {loc} 必须是整数字符下标")
@@ -106,6 +110,8 @@ async def validation_handler(request: Request,
                 range_hint = "，允许范围为 1000～60000"
             elif loc.endswith("padding_ms"):
                 range_hint = "，允许范围为 0～2000" if is_clip_plan else "，允许范围为 0～1000"
+            elif loc.endswith("min_gap_ms"):
+                range_hint = "，须为正整数"
             else:
                 range_hint = ""
             messages.append(f"字段 {loc} 无效{range_hint}")
@@ -282,3 +288,15 @@ async def clip_plan(req: ClipPlanRequest) -> ClipPlanResponse:
     validate_clip_selections(req)
     timeline = build_timeline(req, alignment.backend_name())
     return build_clip_plan(req.revised_text, timeline["chars"], req)
+
+
+@app.post(
+    "/coverage-gaps",
+    response_model=list[CoverageGap],
+    tags=["覆盖缺口审计"],
+)
+async def coverage_gaps(req: CoverageGapsRequest) -> list[CoverageGap]:
+    """求识别字符覆盖之外的录音缺口，并关联两侧 matched 与内部 computed 字符。"""
+    validate_request(req, MAX_RECOGNIZED_CHARS, MAX_REVISED_LENGTH)
+    timeline = build_timeline(req, alignment.backend_name())
+    return build_coverage_gaps(req, timeline["chars"])

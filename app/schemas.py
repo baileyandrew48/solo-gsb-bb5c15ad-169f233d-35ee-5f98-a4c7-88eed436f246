@@ -183,6 +183,15 @@ class ClipPlanRequest(AlignRequest):
     )
 
 
+class CoverageGapsRequest(AlignRequest):
+    """校时输入与覆盖缺口审计参数。"""
+
+    min_gap_ms: StrictInt = Field(
+        ..., ge=1,
+        description="最小缺口时长（毫秒）：仅输出时长不少于该值的缺口，须为正整数",
+    )
+
+
 class RevisedCharTimeline(BaseModel):
     char: str = Field(..., description="修订文本中的字符")
     start: int = Field(..., description="起始时间（毫秒）")
@@ -368,3 +377,28 @@ class ClipPlanResponse(BaseModel):
         ..., description="成片总时长（毫秒），等于各片段时长之和")
     selections: list[ClipSelectionResult] = Field(
         ..., description="每个选中字符区间的成片归属与时间，按输入顺序返回")
+
+
+class ComputedSpan(BaseModel):
+    """一段连续 computed 修订字符在修订文本中的半开下标区间。"""
+
+    start_index: int = Field(
+        ..., description="段首字符在修订文本中的下标（从 0 开始，半开区间）")
+    end_index: int = Field(
+        ..., description="段末字符下标（不含该位置）")
+
+
+class CoverageGap(BaseModel):
+    """单个录音覆盖缺口：起止毫秒、两侧最近 matched 修订字符与内部 computed 段。"""
+
+    start: int = Field(..., description="缺口起始毫秒（含）")
+    end: int = Field(..., description="缺口结束毫秒（不含）")
+    left_matched_index: int | None = Field(
+        ..., description="缺口左侧最近的 matched 修订字符在修订文本中的下标"
+        "（从 0 开始）；左侧没有 matched 修订字符时为 null")
+    right_matched_index: int | None = Field(
+        ..., description="缺口右侧最近的 matched 修订字符在修订文本中的下标"
+        "（从 0 开始）；右侧没有 matched 修订字符时为 null")
+    computed_spans: list[ComputedSpan] = Field(
+        ..., description="时间与缺口相交的连续 computed 修订字符半开下标段，"
+        "按原文顺序；没有则为空列表")
